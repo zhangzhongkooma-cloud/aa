@@ -11,6 +11,7 @@ from src.trading.connectors.binance.profiles import BINANCE_PROFILES
 from src.trading.connectors.dhan.profiles import DHAN_PROFILES
 from src.trading.connectors.futu.profiles import FUTU_PROFILES
 from src.trading.connectors.ibkr.profiles import IBKR_PROFILES
+from src.trading.connectors.icici_breeze.profiles import ICICI_BREEZE_PROFILES
 from src.trading.connectors.longbridge.profiles import LONGBRIDGE_PROFILES
 from src.trading.connectors.mt5.profiles import MT5_PROFILES
 from src.trading.connectors.okx.profiles import OKX_PROFILES
@@ -25,6 +26,7 @@ DEFAULT_PROFILE_ID = "ibkr-paper-local"
 
 BUILTIN_PROFILES: tuple[TradingProfile, ...] = (
     *IBKR_PROFILES,
+    *ICICI_BREEZE_PROFILES,
     *ROBINHOOD_PROFILES,
     *TIGER_PROFILES,
     *LONGBRIDGE_PROFILES,
