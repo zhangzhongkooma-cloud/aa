@@ -3006,13 +3006,33 @@ def cmd_channels_pairing(channel: str, command: str) -> int:
     return EXIT_SUCCESS
 
 
-def cmd_channels_login(channel_name: str, *, force: bool = False) -> int:
+def cmd_channels_login(
+    channel_name: str,
+    *,
+    account_id: str = "primary",
+    force: bool = False,
+) -> int:
     """Run a channel adapter's interactive login hook when available."""
     import asyncio
 
     from src.channels.config import load_channels_config
     from src.channels.manager import ChannelManager
     from src.channels.bus.queue import MessageBus
+    from src.channels.weixin_routing import (
+        PRIMARY_ACCOUNT_ID,
+        validate_account_alias,
+    )
+
+    if channel_name != "weixin" and account_id != PRIMARY_ACCOUNT_ID:
+        console.print("[red]--account is supported only for the weixin channel.[/red]")
+        return EXIT_USAGE_ERROR
+
+    if channel_name == "weixin" and account_id != PRIMARY_ACCOUNT_ID:
+        try:
+            account_id = validate_account_alias(account_id)
+        except ValueError:
+            console.print("[red]Invalid Weixin account alias.[/red]")
+            return EXIT_USAGE_ERROR
 
     config = load_channels_config()
     section = dict(config.get(channel_name, {})) if isinstance(config.get(channel_name), dict) else {}
@@ -3032,7 +3052,20 @@ def cmd_channels_login(channel_name: str, *, force: bool = False) -> int:
         recovery = status.get("install_hint") or status.get("error") or "adapter unavailable"
         console.print(f"[red]Channel '{channel_name}' is unavailable.[/red] {recovery}")
         return EXIT_RUN_FAILED
-    ok = asyncio.run(adapter.login(force=force))
+    if channel_name == "weixin":
+        try:
+            adapter.account(account_id)
+        except KeyError:
+            console.print(
+                "[red]Unknown configured Weixin account:[/red] "
+                f"{rich_escape(account_id)}"
+            )
+            return EXIT_USAGE_ERROR
+        ok = asyncio.run(
+            adapter.login_account(account_id, force=force)
+        )
+    else:
+        ok = asyncio.run(adapter.login(force=force))
     if ok:
         console.print(f"[green]Channel '{channel_name}' login completed.[/green]")
         return EXIT_SUCCESS
@@ -3053,7 +3086,11 @@ def _dispatch_channels(args: argparse.Namespace) -> int:
         text = " ".join([args.pairing_command, *args.pairing_args]).strip()
         return cmd_channels_pairing(args.channel, text or "list")
     if command == "login":
-        return cmd_channels_login(args.channel_name, force=args.force)
+        return cmd_channels_login(
+            args.channel_name,
+            account_id=args.account_id,
+            force=args.force,
+        )
     console.print("[red]channels requires a subcommand.[/red] Try: vibe-trading channels status")
     return EXIT_USAGE_ERROR
 # QVERIS-INTEGRATION
@@ -4606,6 +4643,12 @@ def _build_parser() -> argparse.ArgumentParser:
     channels_stop.add_argument("--json", dest="channels_json", action="store_true", help="Print JSON")
     channels_login = channels_subparsers.add_parser("login", help="Run a channel adapter login hook")
     channels_login.add_argument("channel_name", help="Channel name, e.g. weixin, feishu, whatsapp")
+    channels_login.add_argument(
+        "--account",
+        dest="account_id",
+        default="primary",
+        help="Configured Weixin account alias (default: primary)",
+    )
     channels_login.add_argument("--force", action="store_true", help="Ignore existing credentials where supported")
     channels_pairing = channels_subparsers.add_parser("pairing", help="Manage IM sender pairing")
     channels_pairing.add_argument("--channel", default="telegram", help="Channel context for list/revoke commands")

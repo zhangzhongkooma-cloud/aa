@@ -284,6 +284,8 @@ if ChatOpenAI is not None:
             is absent, breaking ReAct continuations after a tool call (#39).
             """
             payload = super()._get_request_payload(input_, stop=stop, **kwargs)
+            if "messages" not in payload:
+                return payload
             messages = super()._convert_input(input_).to_messages()
             caps = self._capabilities()
             for i, m in enumerate(payload["messages"]):
@@ -739,6 +741,9 @@ def build_llm(*, model_name: Optional[str] = None, callbacks: Any = None) -> Any
     # Optional reasoning activation for relays requiring opt-in (e.g. OpenRouter).
     # Moonshot/DeepSeek official APIs emit reasoning by default and ignore this field.
     effort = get_env_config().llm.langchain_reasoning_effort.strip().lower()
+    use_responses_api = os.getenv(
+        "VIBE_OPENAI_USE_RESPONSES_API", ""
+    ).strip().lower() in {"1", "true", "yes", "on"}
     kwargs: dict[str, Any] = {
         "model": name,
         "temperature": temperature,
@@ -752,6 +757,8 @@ def build_llm(*, model_name: Optional[str] = None, callbacks: Any = None) -> Any
         ),
         "vibe_provider": provider,
     }
+    if provider == "openai" and use_responses_api:
+        kwargs["use_responses_api"] = True
     if caps.default_headers:
         headers = dict(caps.default_headers)
         if caps.name in {"moonshot", "kimi-coding"}:

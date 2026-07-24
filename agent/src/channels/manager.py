@@ -5,9 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
-from collections.abc import Callable
 from contextlib import suppress
-from pathlib import Path
 from typing import Any
 
 from src.channels.base import BaseChannel
@@ -19,6 +17,7 @@ from src.channels.registry import (
     inspect_channels,
     load_channel_class,
 )
+from src.channels.utils import opaque_log_id
 from src.config.paths import get_workspace_path
 
 logger = logging.getLogger(__name__)
@@ -335,7 +334,8 @@ class ChannelManager:
                         if self._should_suppress_outbound(msg):
                             logger.info(
                                 "Suppressing duplicate outbound message to %s:%s",
-                                msg.channel, msg.chat_id,
+                                msg.channel,
+                                opaque_log_id(msg.chat_id),
                             )
                             continue
                     await self._send_with_retry(channel, msg)
@@ -470,6 +470,9 @@ class ChannelManager:
                     "display_name": getattr(channel, "display_name", name),
                 }
             )
+            details = channel.status_details()
+            if details:
+                status[name].update(details)
         return status
 
     @property

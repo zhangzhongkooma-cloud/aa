@@ -4,15 +4,19 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import logging
 from pathlib import Path
 from typing import Any
 
 import pytest
 
+from src.channels.base import BaseChannel
 from src.channels.bus.events import InboundMessage, OutboundMessage
 from src.channels.bus.queue import MessageBus
 from src.channels.manager import ChannelManager
 from src.channels.registry import discover_channel_names, inspect_channels
+from src.channels.weixin_routing import encode_aux_route
+from src.channels.utils import opaque_log_id
 from src.config.schema import ChannelsConfig
 from src.channelsui.cli_apps_api import normalize_cli_app_mentions
 from src.channelsui.gateway_services import build_gateway_services
@@ -69,6 +73,31 @@ class FakeSessionService:
     def get_messages(self, session_id: str, limit: int = 100) -> list[Message]:
         del limit
         return list(self.messages.get(session_id, []))
+
+
+class DefaultStatusChannel(BaseChannel):
+    name = "status-test"
+    display_name = "Status Test"
+
+    async def start(self) -> None:
+        return None
+
+    async def stop(self) -> None:
+        return None
+
+    async def send(self, msg: OutboundMessage) -> None:
+        del msg
+
+
+class DetailedStatusChannel(DefaultStatusChannel):
+    def __init__(self, bus: MessageBus, details: dict[str, Any]) -> None:
+        super().__init__({}, bus)
+        self.details = details
+        self.status_details_calls = 0
+
+    def status_details(self) -> dict[str, Any]:
+        self.status_details_calls += 1
+        return self.details
 
 
 def test_channel_manager_can_construct_websocket_with_default_gateway() -> None:
@@ -161,6 +190,46 @@ def test_channel_manager_status_includes_every_configured_adapter() -> None:
     if not status["slack"]["loaded"]:
         assert status["slack"]["error"]
         assert status["slack"]["install_hint"].startswith("pip install")
+
+
+def test_base_channel_status_details_default_to_empty() -> None:
+    channel = DefaultStatusChannel({}, MessageBus())
+
+    assert channel.status_details() == {}
+
+
+def test_channel_manager_merges_adapter_status_details() -> None:
+    bus = MessageBus()
+    manager = ChannelManager({}, bus)
+    channel = DetailedStatusChannel(
+        bus,
+        {"accounts": {"primary": {"running": True}}},
+    )
+    manager.channels["status-test"] = channel
+
+    status = manager.get_status()["status-test"]
+
+    assert status == {
+        "enabled": True,
+        "loaded": True,
+        "running": False,
+        "display_name": "Status Test",
+        "accounts": {"primary": {"running": True}},
+    }
+    assert channel.status_details_calls == 1
+
+
+def test_channel_manager_empty_status_details_do_not_change_payload() -> None:
+    bus = MessageBus()
+    manager = ChannelManager({}, bus)
+    manager.channels["status-test"] = DefaultStatusChannel({}, bus)
+
+    assert manager.get_status()["status-test"] == {
+        "enabled": True,
+        "loaded": True,
+        "running": False,
+        "display_name": "Status Test",
+    }
 
 
 def test_registry_marks_lazy_sdk_adapter_unavailable(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -328,7 +397,9 @@ def test_channel_runtime_handles_pairing_commands_without_agent(tmp_path: Path, 
 
 
 def test_channel_runtime_rejects_pairing_from_non_operator(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """A non-operator /pairing command is refused without touching the store (GHSA-fwpw)."""
 
@@ -374,7 +445,12 @@ def test_channel_runtime_rejects_pairing_from_non_operator(
         assert pairing.is_approved("signal", "victim-sender") is False
         assert any(item["code"] == code for item in pairing.list_pending())
 
-    asyncio.run(scenario())
+    with caplog.at_level(logging.WARNING, logger="src.channels.runtime"):
+        asyncio.run(scenario())
+
+    assert opaque_log_id("stranger") in caplog.text
+    assert "stranger" not in caplog.text
+    assert "chat-1" not in caplog.text
 
 
 def test_channel_runtime_operator_can_pair(
@@ -628,6 +704,179 @@ def test_channel_runtime_new_command_resets_session_and_creates_fresh_one(tmp_pa
             await runtime.stop()
 
         assert service.sent == [("session-1", "hello"), ("session-2", "after reset")]
+
+    asyncio.run(scenario())
+
+
+def test_channel_runtime_error_log_and_reply_hide_identifiers_and_exception_text(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    from src.channels.runtime import ChannelRuntime
+
+    raw_peer = "FAKE-RUNTIME-RAW-PEER-SENTINEL"
+    route = encode_aux_route("account2", raw_peer)
+    sentinels = {
+        raw_peer,
+        route,
+        "FAKE-RUNTIME-TOKEN-SENTINEL",
+        "FAKE-RUNTIME-CONTEXT-SENTINEL",
+        "https://cdn.invalid/FAKE-RUNTIME-CDN-SENTINEL",
+        "/FAKE-RUNTIME-PRIVATE-PATH-SENTINEL/journal.xlsx",
+    }
+    bus = MessageBus()
+    service = FakeSessionService()
+    runtime = ChannelRuntime(
+        bus=bus,
+        session_service=service,
+        manager=None,
+        session_map_path=tmp_path / "channel_sessions.json",
+    )
+
+    async def fail_send_message(*args: Any, **kwargs: Any) -> dict[str, str]:
+        del args, kwargs
+        raise RuntimeError(" ".join(sorted(sentinels)))
+
+    monkeypatch.setattr(service, "send_message", fail_send_message)
+    message = InboundMessage(
+        channel="weixin",
+        sender_id=route,
+        chat_id=route,
+        content="hello",
+    )
+
+    with caplog.at_level(logging.ERROR, logger="src.channels.runtime"):
+        asyncio.run(runtime._handle_inbound(message))
+    outbound = asyncio.run(bus.consume_outbound())
+
+    assert opaque_log_id(route) in caplog.text
+    assert "RuntimeError" in caplog.text
+    assert outbound.content == "Channel runtime error: RuntimeError"
+    for sentinel in sentinels:
+        assert sentinel not in caplog.text
+        assert sentinel not in outbound.content
+
+
+def test_channel_manager_duplicate_suppression_logs_opaque_target(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    async def scenario() -> tuple[list[OutboundMessage], str]:
+        bus = MessageBus()
+        channel = DefaultStatusChannel({}, bus)
+        sent: list[OutboundMessage] = []
+        first_sent = asyncio.Event()
+
+        async def capture_send(msg: OutboundMessage) -> None:
+            sent.append(msg)
+            first_sent.set()
+
+        channel.send = capture_send  # type: ignore[method-assign]
+        manager = ChannelManager.__new__(ChannelManager)
+        manager.config = {"send_max_retries": 1}
+        manager.bus = bus
+        manager.channels = {"weixin": channel}
+        manager._origin_reply_fingerprints = {}
+        raw_target = encode_aux_route(
+            "account2",
+            "FAKE-DUPLICATE-TARGET-SENTINEL",
+        )
+        first = OutboundMessage(
+            channel="weixin",
+            chat_id=raw_target,
+            content="same response",
+            metadata={"message_id": "FAKE-ORIGIN-ID"},
+        )
+        duplicate = OutboundMessage(
+            channel="weixin",
+            chat_id=raw_target,
+            content="same response",
+            metadata={"origin_message_id": "FAKE-ORIGIN-ID"},
+        )
+
+        task = asyncio.create_task(manager._dispatch_outbound())
+        try:
+            await bus.publish_outbound(first)
+            await asyncio.wait_for(first_sent.wait(), timeout=1)
+            await bus.publish_outbound(duplicate)
+            await asyncio.sleep(0.05)
+        finally:
+            task.cancel()
+            await task
+        return sent, raw_target
+
+    with caplog.at_level(logging.INFO, logger="src.channels.manager"):
+        sent, raw_target = asyncio.run(scenario())
+
+    assert len(sent) == 1
+    assert opaque_log_id(raw_target) in caplog.text
+    assert raw_target not in caplog.text
+
+
+def test_weixin_account_routes_isolate_sessions_and_reset(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        from src.channels.runtime import ChannelRuntime
+
+        map_path = tmp_path / "channel_sessions.json"
+        bus = MessageBus()
+        service = FakeSessionService()
+        runtime = ChannelRuntime(
+            bus=bus,
+            session_service=service,
+            manager=None,
+            session_map_path=map_path,
+            reply_timeout_s=1,
+            poll_interval_s=0.01,
+        )
+        primary_chat_id = "same-peer"
+        auxiliary_chat_id = encode_aux_route("account2", "same-peer")
+        primary_key = f"weixin:{primary_chat_id}"
+        auxiliary_key = f"weixin:{auxiliary_chat_id}"
+
+        await runtime.start(start_manager=False)
+        try:
+            for chat_id in (primary_chat_id, auxiliary_chat_id):
+                await bus.publish_inbound(
+                    InboundMessage(
+                        channel="weixin",
+                        sender_id=chat_id,
+                        chat_id=chat_id,
+                        content="hello",
+                    )
+                )
+                await asyncio.wait_for(bus.consume_outbound(), timeout=1)
+
+            primary_session = runtime._session_map[primary_key]
+            auxiliary_session = runtime._session_map[auxiliary_key]
+            assert primary_session != auxiliary_session
+
+            await bus.publish_inbound(
+                InboundMessage(
+                    channel="weixin",
+                    sender_id=auxiliary_chat_id,
+                    chat_id=auxiliary_chat_id,
+                    content="/new",
+                )
+            )
+            reset_reply = await asyncio.wait_for(bus.consume_outbound(), timeout=1)
+            assert reset_reply.metadata.get("session_reset") is True
+            assert runtime._session_map[primary_key] == primary_session
+            assert auxiliary_key not in runtime._session_map
+
+            await bus.publish_inbound(
+                InboundMessage(
+                    channel="weixin",
+                    sender_id=auxiliary_chat_id,
+                    chat_id=auxiliary_chat_id,
+                    content="after reset",
+                )
+            )
+            await asyncio.wait_for(bus.consume_outbound(), timeout=1)
+
+            assert runtime._session_map[primary_key] == primary_session
+            assert runtime._session_map[auxiliary_key] != auxiliary_session
+        finally:
+            await runtime.stop()
 
     asyncio.run(scenario())
 
